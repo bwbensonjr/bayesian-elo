@@ -2,6 +2,14 @@ import pandas as pd
 from itertools import product
 
 from elo import Elo
+from bayesian_elo import (
+    prepare_data,
+    build_model,
+    fit_model,
+    extract_ratings,
+    predict_outcomes,
+    evaluate_predictions,
+)
 
 
 def read_premier_results():
@@ -122,63 +130,135 @@ def tune_parameters(df):
     return best_params, best_mae
 
 
+def run_bayesian_elo(df, draws=2000, tune=2000, chains=4, target_accept=0.9):
+    """Run the Bayesian rating system on match data.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Match data from read_premier_results().
+    draws, tune, chains, target_accept : int/float
+        MCMC sampling parameters.
+
+    Returns
+    -------
+    trace : arviz.InferenceData
+    predictions : DataFrame
+    data : dict
+    """
+    data = prepare_data(df)
+    print(f"  Teams: {data['n_teams']}, Periods: {data['n_periods']}, "
+          f"Matches: {len(data['outcome'])}")
+    print(f"  Latent parameters: ~{data['n_teams'] * data['n_periods']}")
+
+    model = build_model(data)
+    print(f"  Sampling: {chains} chains x {draws} draws "
+          f"(tune={tune}, target_accept={target_accept})")
+
+    trace = fit_model(model, draws=draws, tune=tune, chains=chains,
+                      target_accept=target_accept)
+
+    predictions = predict_outcomes(trace, data)
+    return trace, predictions, data
+
+
+def run_classical_elo(df):
+    """Run classical Elo and return metrics for comparison."""
+    best_params, best_mae = tune_parameters(df)
+    k = best_params["k"]
+    hf = best_params["home_field"]
+    sf = best_params["spread_factor"]
+
+    results, elo = run_elo(df, k=k, home_field=hf, spread_factor=sf)
+
+    # Win prediction accuracy (excl draws)
+    results["pred_home_win"] = results["pred_home_win_prob"] > 0.5
+    results["actual_home_win"] = results["actual_spread"] > 0
+    non_draws = results[results["actual_spread"] != 0]
+    win_accuracy = (
+        non_draws["pred_home_win"] == non_draws["actual_home_win"]
+    ).mean()
+
+    mae = Elo.calculate_mae(results["pred_spread"], results["actual_spread"])
+
+    rankings = sorted(elo.ratings.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "params": best_params,
+        "mae": mae,
+        "win_accuracy": win_accuracy,
+        "rankings": rankings,
+    }
+
+
 def main():
     df = read_premier_results()
     print(f"Loaded {len(df)} matches across {df['season'].nunique()} seasons")
     print()
 
-    # Tune parameters
+    # --- Classical Elo ---
     print("=" * 60)
-    print("PARAMETER TUNING")
+    print("CLASSICAL ELO")
     print("=" * 60)
-    best_params, best_mae = tune_parameters(df)
+    classical = run_classical_elo(df)
+    print(f"  Parameters: {classical['params']}")
+    print(f"  MAE (point spread): {classical['mae']:.4f}")
+    print(f"  Win prediction accuracy (excl. draws): "
+          f"{classical['win_accuracy']:.1%}")
+    print()
+    print("  Top 10 rankings:")
+    for i, (team, rating) in enumerate(classical["rankings"][:10], 1):
+        print(f"    {i:2d}. {team:25s} {rating:.1f}")
     print()
 
-    # Run with tuned parameters
+    # --- Bayesian Elo ---
     print("=" * 60)
-    print("RESULTS WITH TUNED PARAMETERS")
+    print("BAYESIAN ELO (PyMC)")
     print("=" * 60)
-    k = best_params["k"]
-    hf = best_params["home_field"]
-    sf = best_params["spread_factor"]
-    print(f"Parameters: k={k}, home_field={hf}, spread_factor={sf}")
+    trace, predictions, data = run_bayesian_elo(df)
     print()
 
-    results, elo = run_elo(df, k=k, home_field=hf, spread_factor=sf)
-
-    # Overall metrics
-    mae = Elo.calculate_mae(results["pred_spread"], results["actual_spread"])
-    rmse = Elo.calculate_rmse(results["pred_spread"], results["actual_spread"])
-    print(f"Overall MAE:  {mae:.4f}")
-    print(f"Overall RMSE: {rmse:.4f}")
+    # Evaluation
+    metrics = evaluate_predictions(predictions)
+    print(f"  Categorical accuracy: {metrics['categorical_accuracy']:.1%}")
+    print(f"  Log-loss: {metrics['log_loss']:.4f}")
+    print(f"  Decisive game accuracy: {metrics['decisive_accuracy']:.1%}")
     print()
 
-    # Win prediction accuracy
-    results["pred_home_win"] = results["pred_home_win_prob"] > 0.5
-    results["actual_home_win"] = results["actual_spread"] > 0
-    # Exclude draws for win prediction accuracy
-    non_draws = results[results["actual_spread"] != 0]
-    accuracy = (non_draws["pred_home_win"] == non_draws["actual_home_win"]).mean()
-    print(f"Win prediction accuracy (excl. draws): {accuracy:.1%}")
+    # Draw calibration
+    draw_rate_actual = (predictions["actual_outcome"] == "D").mean()
+    draw_rate_pred = predictions["p_draw"].mean()
+    print(f"  Actual draw rate: {draw_rate_actual:.1%}")
+    print(f"  Mean predicted P(draw): {draw_rate_pred:.1%}")
     print()
 
-    # Per-season MAE
-    print("Per-season MAE:")
-    for season in sorted(results["season"].unique()):
-        s = results[results["season"] == season]
-        s_mae = Elo.calculate_mae(s["pred_spread"], s["actual_spread"])
-        print(f"  {season}: {s_mae:.4f} ({len(s)} games)")
+    # Rankings with uncertainty
+    ratings_df = extract_ratings(trace, data, period=-1)
+    print("  Top 10 rankings (final season):")
+    for i, row in ratings_df.head(10).iterrows():
+        print(f"    {i+1:2d}. {row['team']:25s} "
+              f"{row['rating_mean']:.0f} "
+              f"[{row['ci_lower']:.0f}, {row['ci_upper']:.0f}]")
     print()
 
-    # Final team rankings
-    rankings = sorted(elo.ratings.items(), key=lambda x: x[1], reverse=True)
-    print("Final team rankings (top 10):")
-    for i, (team, rating) in enumerate(rankings[:10], 1):
-        print(f"  {i:2d}. {team:25s} {rating:.1f}")
-    print()
-    print("Final team rankings (bottom 10):")
-    for i, (team, rating) in enumerate(rankings[-10:], len(rankings) - 9):
-        print(f"  {i:2d}. {team:25s} {rating:.1f}")
+    # --- Side-by-side comparison ---
+    print("=" * 60)
+    print("COMPARISON")
+    print("=" * 60)
+    print(f"{'Metric':<35s} {'Classical':>12s} {'Bayesian':>12s}")
+    print("-" * 60)
+    print(f"{'Win accuracy (excl. draws)':<35s} "
+          f"{classical['win_accuracy']:>11.1%} "
+          f"{metrics['decisive_accuracy']:>11.1%}")
+    print(f"{'Categorical accuracy (H/D/A)':<35s} "
+          f"{'N/A':>12s} "
+          f"{metrics['categorical_accuracy']:>11.1%}")
+    print(f"{'Log-loss':<35s} "
+          f"{'N/A':>12s} "
+          f"{metrics['log_loss']:>12.4f}")
+    print(f"{'Point spread MAE':<35s} "
+          f"{classical['mae']:>12.4f} "
+          f"{'N/A':>12s}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+import argparse
+
 import pandas as pd
 from itertools import product
 
@@ -10,6 +12,9 @@ from bayesian_elo import (
     predict_outcomes,
     evaluate_predictions,
 )
+
+# Best Elo parameters from grid search on 1993-2022 Premier League data
+TUNED_ELO_PARAMS = {"k": 3, "home_field": 20, "spread_factor": 55}
 
 
 def read_premier_results():
@@ -162,12 +167,22 @@ def run_bayesian_elo(df, draws=2000, tune=2000, chains=4, target_accept=0.9):
     return trace, predictions, data
 
 
-def run_classical_elo(df):
-    """Run classical Elo and return metrics for comparison."""
-    best_params, best_mae = tune_parameters(df)
-    k = best_params["k"]
-    hf = best_params["home_field"]
-    sf = best_params["spread_factor"]
+def run_classical_elo(df, params=None):
+    """Run classical Elo and return metrics for comparison.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Match data from read_premier_results().
+    params : dict, optional
+        Elo parameters (k, home_field, spread_factor). If None, uses
+        TUNED_ELO_PARAMS.
+    """
+    if params is None:
+        params = TUNED_ELO_PARAMS
+    k = params["k"]
+    hf = params["home_field"]
+    sf = params["spread_factor"]
 
     results, elo = run_elo(df, k=k, home_field=hf, spread_factor=sf)
 
@@ -184,23 +199,15 @@ def run_classical_elo(df):
     rankings = sorted(elo.ratings.items(), key=lambda x: x[1], reverse=True)
 
     return {
-        "params": best_params,
+        "params": params,
         "mae": mae,
         "win_accuracy": win_accuracy,
         "rankings": rankings,
     }
 
 
-def main():
-    df = read_premier_results()
-    print(f"Loaded {len(df)} matches across {df['season'].nunique()} seasons")
-    print()
-
-    # --- Classical Elo ---
-    print("=" * 60)
-    print("CLASSICAL ELO")
-    print("=" * 60)
-    classical = run_classical_elo(df)
+def print_classical_results(classical):
+    """Print classical Elo results."""
     print(f"  Parameters: {classical['params']}")
     print(f"  MAE (point spread): {classical['mae']:.4f}")
     print(f"  Win prediction accuracy (excl. draws): "
@@ -209,42 +216,34 @@ def main():
     print("  Top 10 rankings:")
     for i, (team, rating) in enumerate(classical["rankings"][:10], 1):
         print(f"    {i:2d}. {team:25s} {rating:.1f}")
-    print()
 
-    # --- Bayesian Elo ---
-    print("=" * 60)
-    print("BAYESIAN ELO (PyMC)")
-    print("=" * 60)
-    trace, predictions, data = run_bayesian_elo(df)
-    print()
 
-    # Evaluation
+def print_bayesian_results(trace, predictions, data):
+    """Print Bayesian Elo results and return metrics dict."""
     metrics = evaluate_predictions(predictions)
     print(f"  Categorical accuracy: {metrics['categorical_accuracy']:.1%}")
     print(f"  Log-loss: {metrics['log_loss']:.4f}")
     print(f"  Decisive game accuracy: {metrics['decisive_accuracy']:.1%}")
     print()
 
-    # Draw calibration
     draw_rate_actual = (predictions["actual_outcome"] == "D").mean()
     draw_rate_pred = predictions["p_draw"].mean()
     print(f"  Actual draw rate: {draw_rate_actual:.1%}")
     print(f"  Mean predicted P(draw): {draw_rate_pred:.1%}")
     print()
 
-    # Rankings with uncertainty
     ratings_df = extract_ratings(trace, data, period=-1)
     print("  Top 10 rankings (final season):")
     for i, row in ratings_df.head(10).iterrows():
         print(f"    {i+1:2d}. {row['team']:25s} "
               f"{row['rating_mean']:.0f} "
               f"[{row['ci_lower']:.0f}, {row['ci_upper']:.0f}]")
-    print()
 
-    # --- Side-by-side comparison ---
-    print("=" * 60)
-    print("COMPARISON")
-    print("=" * 60)
+    return metrics
+
+
+def print_comparison(classical, metrics):
+    """Print side-by-side comparison table."""
     print(f"{'Metric':<35s} {'Classical':>12s} {'Bayesian':>12s}")
     print("-" * 60)
     print(f"{'Win accuracy (excl. draws)':<35s} "
@@ -259,6 +258,64 @@ def main():
     print(f"{'Point spread MAE':<35s} "
           f"{classical['mae']:>12.4f} "
           f"{'N/A':>12s}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Premier League rating system comparison"
+    )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Run Elo parameter grid search instead of using saved best params"
+    )
+    parser.add_argument(
+        "--elo-only", action="store_true",
+        help="Run only the classical Elo system"
+    )
+    parser.add_argument(
+        "--bayesian-only", action="store_true",
+        help="Run only the Bayesian system"
+    )
+    args = parser.parse_args()
+
+    df = read_premier_results()
+    print(f"Loaded {len(df)} matches across {df['season'].nunique()} seasons")
+    print()
+
+    run_elo_flag = not args.bayesian_only
+    run_bayesian_flag = not args.elo_only
+
+    classical = None
+    metrics = None
+
+    if run_elo_flag:
+        print("=" * 60)
+        print("CLASSICAL ELO")
+        print("=" * 60)
+        if args.tune:
+            print("Tuning parameters...")
+            best_params, _ = tune_parameters(df)
+            print()
+        else:
+            best_params = TUNED_ELO_PARAMS
+        classical = run_classical_elo(df, params=best_params)
+        print_classical_results(classical)
+        print()
+
+    if run_bayesian_flag:
+        print("=" * 60)
+        print("BAYESIAN ELO (PyMC)")
+        print("=" * 60)
+        trace, predictions, data = run_bayesian_elo(df)
+        print()
+        metrics = print_bayesian_results(trace, predictions, data)
+        print()
+
+    if classical and metrics:
+        print("=" * 60)
+        print("COMPARISON")
+        print("=" * 60)
+        print_comparison(classical, metrics)
 
 
 if __name__ == "__main__":

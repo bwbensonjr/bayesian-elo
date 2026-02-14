@@ -1,6 +1,8 @@
 # Bayesian Elo
 
-Looking at a newly described Bayesian framework for player ratings based on:
+Mark Glickman has invented a Bayesian approach to Chess Elo ratings
+that is better at dealing with the preponderance of draws in
+high-level chess.
 
 [Mark E. Glickman, Rating Competitors in Games with Strength-Dependent
 Tie Probabilities, J. data sci.(2025), 1-20, DOI
@@ -8,5 +10,30 @@ Tie Probabilities, J. data sci.(2025), 1-20, DOI
 
 * [PDF](paper/jds1209.pdf)
 * [Markdown](paper/jds1209.md)
+
+The goal of this exercise is to test out the approach as applied to
+Premier League football which also has a reasonable number of
+draws/tie games.
+
+We will first implement a simple Elo-based rating in Python and
+measure its accuracy. We will then implement the Glickman Bayesian
+method and compare its accuracy to the traditional Elo rating.
+
+## Test Data 
+
+We will use the 11,113 Premier League matches from the 1992-93 season
+through the 2021-22 season in the
+`data/premier-league-1993-2022.parquet` file and read using
+`premier_league.read_premier_results`.
+
+## Elo Methodology 
+
+The Elo harness will be based on the implementation in
+
+https://github.com/bwbensonjr/high-school-sports/blob/main/elo.py
+
+with the parameters tuned for the Premier League results in the test
+data set.
+
 
 

@@ -35,5 +35,27 @@ https://github.com/bwbensonjr/high-school-sports/blob/main/elo.py
 with the parameters tuned for the Premier League results in the test
 data set.
 
+### Tuned Parameters
 
+A two-stage grid search (coarse then fine) over the Elo parameters
+minimized the RMSE of the predicted goal spread versus the actual goal
+spread across all 11,113 matches:
+
+| Parameter | Value |
+|-----------|-------|
+| `k` (K-factor) | 3 |
+| `home_field` (home advantage in Elo points) | 20 |
+| `spread_factor` (Elo-to-goals divisor) | 55 |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| RMSE (predicted vs. actual goal spread) | 1.617 |
+| MAE (predicted vs. actual goal spread) | 1.247 |
+| Win prediction accuracy (excl. draws) | 69.9% |
+
+The final Elo rankings place Man City, Liverpool, Chelsea, Man United,
+and Tottenham as the top five — consistent with historical Premier
+League performance over this period.
 

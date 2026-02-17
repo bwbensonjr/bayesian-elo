@@ -930,6 +930,239 @@ def cross_entropy_evaluation(df,
     return per_game_df, summary_df
 
 
+def training_depth_experiment(df, test_season="2021-22",
+                              depths=None,
+                              weekly=True,
+                              initial_draws=1000, initial_tune=1000,
+                              initial_chains=4,
+                              weekly_draws=500, weekly_tune=500,
+                              weekly_chains=2):
+    """Compare Bayesian/Elo/baseline across different training window depths.
+
+    Holds out test_season and varies how many prior seasons are used for
+    training.  Each depth runs Elo (sequential online), a naive baseline
+    (empirical H/D/A frequencies), and the Bayesian model on the same
+    training slice.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Full match data from read_premier_results().
+    test_season : str
+        Season to hold out as the test set.
+    depths : list
+        Training-window specifications. Each element is one of:
+        - "all"  — all prior seasons
+        - "half" — floor(n_prior / 2) most recent prior seasons
+        - int    — that many most recent prior seasons
+        Defaults to ["all", "half", 1].
+    weekly : bool
+        If True, use BayesianPredictor with weekly in-season refits.
+        If False, use a single predict_out_of_sample call.
+    initial_draws, initial_tune, initial_chains : int
+        MCMC settings for the initial Bayesian fit.
+    weekly_draws, weekly_tune, weekly_chains : int
+        MCMC settings for weekly Bayesian refits (only used when weekly=True).
+
+    Returns
+    -------
+    (per_game_df, summary_df)
+    """
+    if depths is None:
+        depths = ["all", "half", 1]
+
+    all_seasons = sorted(df["season"].unique())
+    if test_season not in all_seasons:
+        raise ValueError(f"test_season {test_season!r} not found in data")
+
+    test_idx = all_seasons.index(test_season)
+    prior_seasons = all_seasons[:test_idx]
+    n_prior = len(prior_seasons)
+    if n_prior == 0:
+        raise ValueError(f"No training seasons before {test_season}")
+
+    test_df = df[df["season"] == test_season].copy().reset_index(drop=True)
+    eps = 1e-10
+
+    all_per_game = []
+
+    for depth_spec in depths:
+        # Determine which training seasons to use
+        if depth_spec == "all":
+            n_train = n_prior
+        elif depth_spec == "half":
+            n_train = n_prior // 2
+        elif isinstance(depth_spec, int):
+            n_train = min(depth_spec, n_prior)
+        else:
+            raise ValueError(f"Invalid depth spec: {depth_spec!r}")
+
+        train_seasons = prior_seasons[-n_train:]
+        depth_label = (f"all ({n_train} seasons)" if depth_spec == "all"
+                       else f"half ({n_train} seasons)" if depth_spec == "half"
+                       else f"{n_train} season{'s' if n_train != 1 else ''}")
+        train_df = df[df["season"].isin(train_seasons)].copy()
+
+        print(f"\n{'=' * 60}")
+        print(f"Depth: {depth_label}")
+        print(f"  Training seasons: {train_seasons[0]} .. {train_seasons[-1]}")
+        print(f"  Training matches: {len(train_df)}")
+        print(f"  Test season: {test_season} ({len(test_df)} matches)")
+        print("=" * 60)
+
+        # --- Baseline: empirical H/D/A frequencies ---
+        freq = train_df["result"].value_counts(normalize=True)
+        freq_h = freq.get("H", 0.0)
+        freq_d = freq.get("D", 0.0)
+        freq_a = freq.get("A", 0.0)
+
+        # --- Elo on training slice + test season ---
+        print("\n  Running Elo...")
+        elo_df = pd.concat([train_df, test_df], ignore_index=True)
+        params = TUNED_ELO_PARAMS
+        elo_results, _ = run_elo(elo_df, k=params["k"],
+                                 home_field=params["home_field"],
+                                 spread_factor=params["spread_factor"])
+        elo_test = elo_results[
+            elo_results["season"] == test_season
+        ].reset_index(drop=True)
+        elo_p_home, elo_p_draw, elo_p_away = elo_3way_probs(
+            elo_test["pred_home_win_prob"].values, freq_d
+        )
+
+        # --- Bayesian ---
+        if weekly:
+            print("  Running Bayesian (weekly refits)...")
+            predictor = BayesianPredictor(
+                train_df,
+                initial_draws=initial_draws, initial_tune=initial_tune,
+                initial_chains=initial_chains,
+                weekly_draws=weekly_draws, weekly_tune=weekly_tune,
+                weekly_chains=weekly_chains,
+            )
+            predictor.fit_initial()
+
+            weeks = group_games_by_week(test_df)
+            n_weeks = len(weeks)
+            bayes_parts = []
+
+            for w_idx, (week_label, week_df) in enumerate(weeks):
+                week_df = week_df.reset_index(drop=True)
+                preds = predictor.predict(week_df)
+                preds["week"] = week_label
+                preds["date"] = week_df["date"].values
+                preds["home_team"] = week_df["home_team"].values
+                preds["away_team"] = week_df["away_team"].values
+                preds["result"] = week_df["result"].values
+                bayes_parts.append(preds)
+
+                is_last = (w_idx == n_weeks - 1)
+                if not is_last:
+                    predictor.update(week_df)
+                print(f"    Week {w_idx+1}/{n_weeks} ({week_label}): "
+                      f"{len(week_df)} games"
+                      f"{'' if not is_last else ' [last, skip refit]'}")
+
+            bayes_preds = pd.concat(bayes_parts, ignore_index=True)
+        else:
+            print("  Running Bayesian (per-season)...")
+            train_data = prepare_data(train_df)
+            model = build_model(train_data)
+            trace = fit_model(model, draws=initial_draws, tune=initial_tune,
+                              chains=initial_chains, target_accept=0.9)
+            bayes_preds = predict_out_of_sample(trace, train_data, test_df)
+            bayes_preds["date"] = test_df["date"].values
+            bayes_preds["home_team"] = test_df["home_team"].values
+            bayes_preds["away_team"] = test_df["away_team"].values
+            bayes_preds["result"] = test_df["result"].values
+
+        # --- Assemble per-game results ---
+        result = bayes_preds["result"].values
+
+        bayes_p_actual = np.where(
+            result == "H", bayes_preds["p_home_win"].values,
+            np.where(result == "D", bayes_preds["p_draw"].values,
+                     bayes_preds["p_away_win"].values))
+        elo_p_actual = np.where(
+            result == "H", elo_p_home,
+            np.where(result == "D", elo_p_draw, elo_p_away))
+        baseline_p_actual = np.where(
+            result == "H", freq_h,
+            np.where(result == "D", freq_d, freq_a))
+
+        row_data = {
+            "depth_label": depth_label,
+            "season": test_season,
+            "date": bayes_preds["date"].values,
+            "home_team": bayes_preds["home_team"].values,
+            "away_team": bayes_preds["away_team"].values,
+            "result": result,
+            "bayes_p_home": bayes_preds["p_home_win"].values,
+            "bayes_p_draw": bayes_preds["p_draw"].values,
+            "bayes_p_away": bayes_preds["p_away_win"].values,
+            "elo_p_home": elo_p_home,
+            "elo_p_draw": elo_p_draw,
+            "elo_p_away": elo_p_away,
+            "baseline_p_home": freq_h,
+            "baseline_p_draw": freq_d,
+            "baseline_p_away": freq_a,
+            "bayes_ce": -np.log(np.clip(bayes_p_actual, eps, 1.0)),
+            "elo_ce": -np.log(np.clip(elo_p_actual, eps, 1.0)),
+            "baseline_ce": -np.log(np.clip(baseline_p_actual, eps, 1.0)),
+        }
+        if weekly and "week" in bayes_preds.columns:
+            row_data["week"] = bayes_preds["week"].values
+
+        depth_df = pd.DataFrame(row_data)
+        all_per_game.append((depth_df, n_train, len(train_df)))
+
+    per_game_df = pd.concat([t[0] for t in all_per_game], ignore_index=True)
+
+    # --- Summary: one row per depth ---
+    summary_rows = []
+    for depth_df, n_train_seasons, n_train_matches in all_per_game:
+        dl = depth_df["depth_label"].iloc[0]
+        summary_rows.append({
+            "depth_label": dl,
+            "n_train_seasons": n_train_seasons,
+            "n_train_matches": n_train_matches,
+            "n_test_matches": len(depth_df),
+            "bayes_ce": depth_df["bayes_ce"].mean(),
+            "elo_ce": depth_df["elo_ce"].mean(),
+            "baseline_ce": depth_df["baseline_ce"].mean(),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    return per_game_df, summary_df
+
+
+def print_training_depth_results(summary_df, test_season="2021-22",
+                                 weekly=False):
+    """Print training depth experiment results."""
+    mode_label = ("weekly in-season refits" if weekly
+                  else "per-season predictions")
+    print()
+    print("=" * 70)
+    print(f"TRAINING DEPTH EXPERIMENT — Test season: {test_season}")
+    print(f"  Bayesian mode: {mode_label}")
+    print("=" * 70)
+    print()
+
+    print(f"  {'Depth':<22s} {'Train':>7s} {'Baseline':>10s} "
+          f"{'Elo':>10s} {'Bayesian':>10s} {'Bayes-Elo':>10s}")
+    print("  " + "-" * 70)
+    for _, row in summary_df.iterrows():
+        diff = row["bayes_ce"] - row["elo_ce"]
+        print(f"  {row['depth_label']:<22s} {int(row['n_train_matches']):>7d} "
+              f"{row['baseline_ce']:>10.4f} {row['elo_ce']:>10.4f} "
+              f"{row['bayes_ce']:>10.4f} {diff:>+10.4f}")
+
+    print()
+    best = summary_df.loc[summary_df["bayes_ce"].idxmin()]
+    print(f"  Lowest Bayesian CE: {best['depth_label']} "
+          f"({best['bayes_ce']:.4f})")
+
+
 def print_cross_entropy_results(summary_df, weekly=False):
     """Print cross-entropy evaluation results."""
     agg = summary_df[summary_df["season"] == "ALL"].iloc[0]
@@ -1104,8 +1337,13 @@ def main():
         help="Run cross-entropy evaluation (Bayesian vs Elo vs baseline)"
     )
     parser.add_argument(
+        "--depth-experiment", action="store_true",
+        help="Run training depth experiment on 2021-22"
+    )
+    parser.add_argument(
         "--weekly", action="store_true",
-        help="Use weekly in-season Bayesian refits (with --cross-entropy)"
+        help="Use weekly in-season Bayesian refits (with --cross-entropy "
+             "or --depth-experiment)"
     )
     parser.add_argument(
         "--initial-draws", type=int, default=1000,
@@ -1149,6 +1387,26 @@ def main():
             weekly_chains=args.weekly_chains,
         )
         print_cross_entropy_results(summary_df, weekly=args.weekly)
+        return
+
+    if args.depth_experiment:
+        per_game_df, summary_df = training_depth_experiment(
+            df,
+            test_season="2021-22",
+            weekly=args.weekly,
+            initial_draws=args.initial_draws,
+            initial_tune=args.initial_tune,
+            initial_chains=args.initial_chains,
+            weekly_draws=args.weekly_draws,
+            weekly_tune=args.weekly_tune,
+            weekly_chains=args.weekly_chains,
+        )
+        per_game_df.to_csv("data/depth-experiment.csv", index=False)
+        summary_df.to_csv("data/depth-experiment-summary.csv", index=False)
+        print(f"\nSaved {len(per_game_df)} per-game rows to "
+              f"data/depth-experiment.csv")
+        print_training_depth_results(summary_df, test_season="2021-22",
+                                     weekly=args.weekly)
         return
 
     if args.compare_2022:

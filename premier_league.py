@@ -63,6 +63,31 @@ def compute_spread_calibration(df):
     }
 
 
+def group_games_by_week(season_df):
+    """Group a season's games by ISO calendar week.
+
+    Parameters
+    ----------
+    season_df : DataFrame
+        Games for a single season with a 'date' column (date objects).
+
+    Returns
+    -------
+    list of (week_label, DataFrame) tuples sorted chronologically.
+    Week labels use ISO format '%G-W%V'.
+    """
+    season_df = season_df.sort_values("date").copy()
+    season_df["_week"] = season_df["date"].apply(
+        lambda d: f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
+    )
+    weeks = []
+    for week_label, group in season_df.groupby("_week", sort=False):
+        weeks.append((week_label, group.drop(columns=["_week"])))
+    # Sort by the earliest date in each group
+    weeks.sort(key=lambda x: x[1]["date"].iloc[0])
+    return weeks
+
+
 def bayesian_spread_predictions(predictions, calibration, df):
     """Derive expected point spreads from Bayesian win/draw/loss probabilities.
 
@@ -300,6 +325,65 @@ def predict_out_of_sample(trace, train_data, test_df):
     })
 
 
+class BayesianPredictor:
+    """Stateful wrapper for incremental Bayesian rating prediction.
+
+    Supports an initial fit on historical data followed by repeated
+    predict → update cycles with lighter MCMC settings for weekly refits.
+    """
+
+    def __init__(self, historical_df,
+                 initial_draws=1000, initial_tune=1000, initial_chains=4,
+                 weekly_draws=500, weekly_tune=500, weekly_chains=2,
+                 target_accept=0.9):
+        self.df = historical_df.copy()
+        self.initial_draws = initial_draws
+        self.initial_tune = initial_tune
+        self.initial_chains = initial_chains
+        self.weekly_draws = weekly_draws
+        self.weekly_tune = weekly_tune
+        self.weekly_chains = weekly_chains
+        self.target_accept = target_accept
+        self.trace = None
+        self.train_data = None
+
+    def fit_initial(self):
+        """Full MCMC fit on historical data (heavier settings)."""
+        self.train_data = prepare_data(self.df)
+        model = build_model(self.train_data)
+        self.trace = fit_model(model,
+                               draws=self.initial_draws,
+                               tune=self.initial_tune,
+                               chains=self.initial_chains,
+                               target_accept=self.target_accept)
+
+    def predict(self, games_df):
+        """Predict upcoming games using current posterior.
+
+        Parameters
+        ----------
+        games_df : DataFrame
+            Games with home_team, away_team, result columns.
+
+        Returns
+        -------
+        DataFrame with p_away_win, p_draw, p_home_win, pred_outcome,
+        actual_outcome columns.
+        """
+        return predict_out_of_sample(self.trace, self.train_data, games_df)
+
+    def update(self, completed_games_df):
+        """Append results and refit with lighter MCMC settings."""
+        self.df = pd.concat([self.df, completed_games_df], ignore_index=True)
+        self.train_data = prepare_data(self.df)
+        model = build_model(self.train_data)
+        self.trace = fit_model(model,
+                               draws=self.weekly_draws,
+                               tune=self.weekly_tune,
+                               chains=self.weekly_chains,
+                               target_accept=self.target_accept)
+
+
 def expanding_window_bayesian(df, draws=1000, tune=1000, chains=4,
                               target_accept=0.9):
     """Run expanding-window Bayesian predictions across all seasons.
@@ -359,6 +443,98 @@ def expanding_window_bayesian(df, draws=1000, tune=1000, chains=4,
             "bayes_pred_spread": bayes_pred_spread.values,
         })
         all_predictions.append(window_df)
+
+    return pd.concat(all_predictions, ignore_index=True)
+
+
+def expanding_window_bayesian_weekly(df,
+                                     initial_draws=1000, initial_tune=1000,
+                                     initial_chains=4,
+                                     weekly_draws=500, weekly_tune=500,
+                                     weekly_chains=2,
+                                     target_accept=0.9):
+    """Run expanding-window Bayesian predictions with weekly in-season refits.
+
+    For each test season s (from 2nd to last):
+      1. Create BayesianPredictor on seasons 1..s-1, fit_initial()
+      2. Group season s into weeks via group_games_by_week()
+      3. For each week: predict() → collect predictions → update() with results
+         (skip refit after the last week of each season)
+
+    Returns a DataFrame with per-match Bayesian predictions for seasons 2..N,
+    with the same schema as expanding_window_bayesian() plus a 'week' column.
+    """
+    all_seasons = sorted(df["season"].unique())
+    all_predictions = []
+
+    for s_idx in range(1, len(all_seasons)):
+        train_seasons = all_seasons[:s_idx]
+        test_season = all_seasons[s_idx]
+
+        train_df = df[df["season"].isin(train_seasons)].copy()
+        test_df = df[df["season"] == test_season].copy().reset_index(drop=True)
+
+        weeks = group_games_by_week(test_df)
+        n_weeks = len(weeks)
+
+        print(f"  Season {s_idx}/{len(all_seasons)-1}: "
+              f"train on {len(train_seasons)} seasons, "
+              f"predict {test_season} ({len(test_df)} matches, "
+              f"{n_weeks} weeks)")
+
+        predictor = BayesianPredictor(
+            train_df,
+            initial_draws=initial_draws, initial_tune=initial_tune,
+            initial_chains=initial_chains,
+            weekly_draws=weekly_draws, weekly_tune=weekly_tune,
+            weekly_chains=weekly_chains,
+            target_accept=target_accept,
+        )
+        predictor.fit_initial()
+
+        # Spread calibration from training data at start of season
+        calibration = compute_spread_calibration(predictor.df)
+
+        for w_idx, (week_label, week_df) in enumerate(weeks):
+            week_df = week_df.reset_index(drop=True)
+            bayes_preds = predictor.predict(week_df)
+
+            bayes_pred_spread = (
+                bayes_preds["p_home_win"] * calibration["H"]
+                + bayes_preds["p_draw"] * calibration["D"]
+                + bayes_preds["p_away_win"] * calibration["A"]
+            )
+
+            window_df = pd.DataFrame({
+                "season": test_season,
+                "week": week_label,
+                "date": week_df["date"].values,
+                "home_team": week_df["home_team"].values,
+                "away_team": week_df["away_team"].values,
+                "home_goals": week_df["home_team_goals"].values,
+                "away_goals": week_df["away_team_goals"].values,
+                "result": week_df["result"].values,
+                "actual_spread": week_df["actual_spread"].values,
+                "bayes_p_home_win": bayes_preds["p_home_win"].values,
+                "bayes_p_draw": bayes_preds["p_draw"].values,
+                "bayes_p_away_win": bayes_preds["p_away_win"].values,
+                "bayes_pred_outcome": bayes_preds["pred_outcome"].values,
+                "bayes_pred_spread": bayes_pred_spread.values,
+            })
+            all_predictions.append(window_df)
+
+            # Skip refit after the last week of each season
+            is_last_week = (w_idx == n_weeks - 1)
+            if not is_last_week:
+                # Update calibration with newly observed games
+                calibration = compute_spread_calibration(
+                    pd.concat([predictor.df, week_df], ignore_index=True)
+                )
+                predictor.update(week_df)
+
+            print(f"    Week {w_idx+1}/{n_weeks} ({week_label}): "
+                  f"{len(week_df)} games"
+                  f"{'' if not is_last_week else ' [last, skip refit]'}")
 
     return pd.concat(all_predictions, ignore_index=True)
 
@@ -564,6 +740,240 @@ def generate_comparison_csv(df, output_path="data/premier-league-sequential-comp
     return csv_df, metrics
 
 
+def elo_3way_probs(elo_home_win_prob, draw_rate):
+    """Convert Elo 2-way home-win probability to 3-way (H/D/A) probabilities.
+
+    Uses a fixed empirical draw rate to carve out draw probability, then
+    splits the remaining mass using the Elo-derived home-win probability.
+
+    Parameters
+    ----------
+    elo_home_win_prob : array-like
+        Elo-derived P(home win) for each match (2-way, no draws).
+    draw_rate : float
+        Empirical draw rate from training data.
+
+    Returns
+    -------
+    tuple of (p_home_win, p_draw, p_away_win), each as np.ndarray
+    """
+    elo_home_win_prob = np.asarray(elo_home_win_prob)
+    p_draw = np.full_like(elo_home_win_prob, draw_rate)
+    p_home = (1 - draw_rate) * elo_home_win_prob
+    p_away = (1 - draw_rate) * (1 - elo_home_win_prob)
+    return p_home, p_draw, p_away
+
+
+def cross_entropy_evaluation(df,
+                             output_path="data/cross-entropy-evaluation.csv",
+                             weekly=False,
+                             initial_draws=1000, initial_tune=1000,
+                             initial_chains=4,
+                             weekly_draws=500, weekly_tune=500,
+                             weekly_chains=2):
+    """Expanding-window cross-entropy comparison: Bayesian vs Elo vs baseline.
+
+    For each test season s (from 2nd to last):
+      - Bayesian: train on 1..s-1, predict s (direct 3-way probabilities)
+      - Elo: sequential online updates, convert to 3-way using per-window
+        empirical draw rate
+      - Baseline: empirical H/D/A frequencies from training seasons
+
+    When weekly=True, uses weekly in-season refits instead of per-season
+    predictions for the Bayesian model.
+
+    Returns
+    -------
+    tuple of (per_game_df, summary_df)
+        per_game_df has per-match probabilities and cross-entropy contributions.
+        summary_df has per-season and aggregate cross-entropy for each model.
+    """
+    all_seasons = sorted(df["season"].unique())
+    n_windows = len(all_seasons) - 1
+
+    # --- Run Elo on ALL data (sequential online updates) ---
+    print("Running Classical Elo on all data (sequential)...")
+    params = TUNED_ELO_PARAMS
+    elo_results, _ = run_elo(df, k=params["k"], home_field=params["home_field"],
+                             spread_factor=params["spread_factor"])
+    print()
+
+    # --- Run Bayesian expanding-window ---
+    if weekly:
+        print(f"Running Bayesian weekly expanding-window "
+              f"({n_windows} seasons, weekly refits)...")
+        print(f"  Initial MCMC: {initial_chains} chains x {initial_draws} "
+              f"draws (tune={initial_tune})")
+        print(f"  Weekly MCMC:  {weekly_chains} chains x {weekly_draws} "
+              f"draws (tune={weekly_tune})")
+        bayes_results = expanding_window_bayesian_weekly(
+            df,
+            initial_draws=initial_draws, initial_tune=initial_tune,
+            initial_chains=initial_chains,
+            weekly_draws=weekly_draws, weekly_tune=weekly_tune,
+            weekly_chains=weekly_chains,
+        )
+    else:
+        print(f"Running Bayesian expanding-window ({n_windows} MCMC fits)...")
+        bayes_results = expanding_window_bayesian(df)
+    print()
+
+    # --- Build per-game evaluation DataFrame ---
+    # Align Elo results with Bayesian results (seasons 2..N)
+    bayes_seasons = all_seasons[1:]
+    elo_test = elo_results[
+        elo_results["season"].isin(bayes_seasons)
+    ].reset_index(drop=True)
+
+    season_dfs = []
+    for s_idx in range(1, len(all_seasons)):
+        test_season = all_seasons[s_idx]
+        train_seasons = all_seasons[:s_idx]
+        train_df = df[df["season"].isin(train_seasons)]
+
+        # Empirical outcome frequencies from training data
+        train_counts = train_df["result"].value_counts(normalize=True)
+        freq_h = train_counts.get("H", 0.0)
+        freq_d = train_counts.get("D", 0.0)
+        freq_a = train_counts.get("A", 0.0)
+
+        # Season slices
+        bayes_season = bayes_results[
+            bayes_results["season"] == test_season
+        ].reset_index(drop=True)
+        elo_season = elo_test[
+            elo_test["season"] == test_season
+        ].reset_index(drop=True)
+
+        n = len(bayes_season)
+
+        # Elo 3-way probs using training draw rate
+        elo_p_home, elo_p_draw, elo_p_away = elo_3way_probs(
+            elo_season["pred_home_win_prob"].values, freq_d
+        )
+
+        result = bayes_season["result"].values
+
+        # Bayesian P(actual outcome)
+        bayes_p_actual = np.where(
+            result == "H", bayes_season["bayes_p_home_win"].values,
+            np.where(result == "D", bayes_season["bayes_p_draw"].values,
+                     bayes_season["bayes_p_away_win"].values))
+
+        # Elo P(actual outcome)
+        elo_p_actual = np.where(
+            result == "H", elo_p_home,
+            np.where(result == "D", elo_p_draw, elo_p_away))
+
+        # Baseline P(actual outcome)
+        baseline_p_actual = np.where(
+            result == "H", freq_h,
+            np.where(result == "D", freq_d, freq_a))
+
+        eps = 1e-10
+        s_df_data = {
+            "season": test_season,
+            "date": bayes_season["date"].values,
+            "home_team": bayes_season["home_team"].values,
+            "away_team": bayes_season["away_team"].values,
+            "result": result,
+            "bayes_p_home": bayes_season["bayes_p_home_win"].values,
+            "bayes_p_draw": bayes_season["bayes_p_draw"].values,
+            "bayes_p_away": bayes_season["bayes_p_away_win"].values,
+            "elo_p_home": elo_p_home,
+            "elo_p_draw": elo_p_draw,
+            "elo_p_away": elo_p_away,
+            "baseline_p_home": freq_h,
+            "baseline_p_draw": freq_d,
+            "baseline_p_away": freq_a,
+            "bayes_ce": -np.log(np.clip(bayes_p_actual, eps, 1.0)),
+            "elo_ce": -np.log(np.clip(elo_p_actual, eps, 1.0)),
+            "baseline_ce": -np.log(np.clip(baseline_p_actual, eps, 1.0)),
+        }
+        if weekly and "week" in bayes_season.columns:
+            s_df_data["week"] = bayes_season["week"].values
+        s_df = pd.DataFrame(s_df_data)
+        season_dfs.append(s_df)
+
+    per_game_df = pd.concat(season_dfs, ignore_index=True)
+    per_game_df.to_csv(output_path, index=False)
+    print(f"Saved {len(per_game_df)} per-game rows to {output_path}")
+
+    # --- Compute per-season and aggregate summary ---
+    summary_rows = []
+    for season in bayes_seasons:
+        s_df = per_game_df[per_game_df["season"] == season]
+        n = len(s_df)
+        summary_rows.append({
+            "season": season,
+            "n_matches": n,
+            "bayes_ce": s_df["bayes_ce"].mean(),
+            "elo_ce": s_df["elo_ce"].mean(),
+            "baseline_ce": s_df["baseline_ce"].mean(),
+        })
+
+    # Aggregate row
+    summary_rows.append({
+        "season": "ALL",
+        "n_matches": len(per_game_df),
+        "bayes_ce": per_game_df["bayes_ce"].mean(),
+        "elo_ce": per_game_df["elo_ce"].mean(),
+        "baseline_ce": per_game_df["baseline_ce"].mean(),
+    })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    summary_path = output_path.replace(".csv", "-summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Saved summary to {summary_path}")
+
+    return per_game_df, summary_df
+
+
+def print_cross_entropy_results(summary_df, weekly=False):
+    """Print cross-entropy evaluation results."""
+    agg = summary_df[summary_df["season"] == "ALL"].iloc[0]
+    seasons = summary_df[summary_df["season"] != "ALL"]
+
+    mode_label = "weekly in-season refits" if weekly else "per-season predictions"
+
+    print()
+    print("=" * 70)
+    print("CROSS-ENTROPY EVALUATION (a la Glickman 2025, Section 6)")
+    print(f"  Bayesian mode: {mode_label}")
+    print("=" * 70)
+    print()
+    print(f"Total matches evaluated: {int(agg['n_matches'])}")
+    print()
+
+    # Aggregate results
+    print("Aggregate Cross-Entropy (lower is better):")
+    print(f"  {'Model':<20s} {'Cross-Entropy':>14s} {'vs Baseline':>14s}")
+    print("  " + "-" * 50)
+    print(f"  {'Naive baseline':<20s} {agg['baseline_ce']:>14.4f} {'--':>14s}")
+    print(f"  {'Classical Elo':<20s} {agg['elo_ce']:>14.4f} "
+          f"{(1 - agg['elo_ce'] / agg['baseline_ce']):>13.1%}")
+    print(f"  {'Bayesian':<20s} {agg['bayes_ce']:>14.4f} "
+          f"{(1 - agg['bayes_ce'] / agg['baseline_ce']):>13.1%}")
+    print()
+
+    # Per-season breakdown
+    print("Per-Season Cross-Entropy:")
+    print(f"  {'Season':<12s} {'N':>5s} {'Baseline':>10s} "
+          f"{'Elo':>10s} {'Bayesian':>10s} {'Bayes-Elo':>10s}")
+    print("  " + "-" * 60)
+    for _, row in seasons.iterrows():
+        diff = row["bayes_ce"] - row["elo_ce"]
+        print(f"  {str(row['season']):<12s} {int(row['n_matches']):>5d} "
+              f"{row['baseline_ce']:>10.4f} {row['elo_ce']:>10.4f} "
+              f"{row['bayes_ce']:>10.4f} {diff:>+10.4f}")
+
+    print()
+    bayes_better = (seasons["bayes_ce"] < seasons["elo_ce"]).sum()
+    total = len(seasons)
+    print(f"Bayesian lower CE than Elo in {bayes_better}/{total} seasons")
+
+
 def generate_analysis_markdown(metrics,
                                output_path="data/sequential-comparison-analysis.md"):
     """Write a Markdown analysis of the expanding-window comparison."""
@@ -689,11 +1099,57 @@ def main():
         "--compare-2022", action="store_true",
         help="Run expanding-window sequential comparison (Elo vs Bayesian)"
     )
+    parser.add_argument(
+        "--cross-entropy", action="store_true",
+        help="Run cross-entropy evaluation (Bayesian vs Elo vs baseline)"
+    )
+    parser.add_argument(
+        "--weekly", action="store_true",
+        help="Use weekly in-season Bayesian refits (with --cross-entropy)"
+    )
+    parser.add_argument(
+        "--initial-draws", type=int, default=1000,
+        help="MCMC draws for initial fit (default: 1000)"
+    )
+    parser.add_argument(
+        "--initial-tune", type=int, default=1000,
+        help="MCMC tune steps for initial fit (default: 1000)"
+    )
+    parser.add_argument(
+        "--initial-chains", type=int, default=4,
+        help="MCMC chains for initial fit (default: 4)"
+    )
+    parser.add_argument(
+        "--weekly-draws", type=int, default=500,
+        help="MCMC draws for weekly refits (default: 500)"
+    )
+    parser.add_argument(
+        "--weekly-tune", type=int, default=500,
+        help="MCMC tune steps for weekly refits (default: 500)"
+    )
+    parser.add_argument(
+        "--weekly-chains", type=int, default=2,
+        help="MCMC chains for weekly refits (default: 2)"
+    )
     args = parser.parse_args()
 
     df = read_premier_results()
     print(f"Loaded {len(df)} matches across {df['season'].nunique()} seasons")
     print()
+
+    if args.cross_entropy:
+        _, summary_df = cross_entropy_evaluation(
+            df,
+            weekly=args.weekly,
+            initial_draws=args.initial_draws,
+            initial_tune=args.initial_tune,
+            initial_chains=args.initial_chains,
+            weekly_draws=args.weekly_draws,
+            weekly_tune=args.weekly_tune,
+            weekly_chains=args.weekly_chains,
+        )
+        print_cross_entropy_results(summary_df, weekly=args.weekly)
+        return
 
     if args.compare_2022:
         print("=" * 60)

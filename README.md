@@ -4,6 +4,9 @@ Mark Glickman has invented a Bayesian approach to Chess Elo ratings
 that is better at dealing with the preponderance of draws in
 high-level chess.
 
+Harvard Gazette article: [Breaking chess's ratings
+stalemate](https://news.harvard.edu/gazette/story/2026/02/breaking-chesss-rating-stalemate/)
+
 [Mark E. Glickman, Rating Competitors in Games with Strength-Dependent
 Tie Probabilities, J. data sci.(2025), 1-20, DOI
 10.6339/25-JDS1209](https://jds-online.org/journal/JDS/article/1455/info)
@@ -85,7 +88,7 @@ non-centered parameterization for efficient NUTS sampling.
 
 **Rating conversion (Eq 6.1):** R = 1500 + 173.72 · θ
 
-### Simplifications vs. the Paper
+### Differences from the Paper's Filtering Algorithm
 
 - **No Gauss-Hermite quadrature or Newton-Raphson** — PyMC/NUTS
   samples the full joint posterior directly
@@ -94,6 +97,9 @@ non-centered parameterization for efficient NUTS sampling.
 - **System parameters estimated jointly** with latent strengths
   (fully Bayesian) rather than optimized separately via predictive
   likelihood
+
+See the [Glickman Filter](#glickman-filter) section below for an
+implementation of the paper's approximate filtering algorithm.
 
 ### Results
 
@@ -138,6 +144,80 @@ credible intervals:
 The Bayesian model improves decisive game prediction by 2.4 percentage
 points, and its draw calibration is essentially perfect (25.8%
 predicted vs. 25.8% actual).
+
+## Glickman Filter
+
+`glickman_filter.py` implements the approximate filtering algorithm
+from Sections 4.1-4.3 of the paper. This provides closed-form
+posterior updates with no PyMC dependency, making it orders of
+magnitude faster than MCMC for the same model.
+
+### Algorithm
+
+The filter processes games period-by-period (one season per period):
+
+1. **Opponent-prior approximation (Section 4.1):** Within each period,
+   all players are updated using opponents' *prior* distributions
+   (from the start of the period), making updates independent across
+   players.
+
+2. **2-point Gauss-Hermite quadrature (Section 4.2):** The integral
+   over opponent strength is approximated by evaluating the likelihood
+   at μ\_j ± σ\_j with equal weights 1/2.
+
+3. **One-step Newton-Raphson (Section 4.3):** The posterior for each
+   player is approximated as Gaussian with mean μ\* = μ − g/h and
+   variance σ\*² = −1/h, where g and h are the gradient and Hessian
+   of the log-posterior evaluated at the prior mean.
+
+4. **Period advance:** σ\_prior = min(√(σ\_post² + τ²), σ\_cap)
+
+### System Parameters
+
+System parameters (`alpha0`, `alpha1`, `beta0`, `beta1`, `tau`,
+`sigma_init`, `sigma_cap`) are treated as fixed inputs, not sampled.
+They can be optimized via one-step-ahead predictive log-likelihood
+(Section 5) using `optimize_params()`.
+
+### Results (Default Parameters)
+
+| Metric | MCMC | Filter |
+|--------|------|--------|
+| Categorical accuracy (H/D/A) | 53.7% | 49.4% |
+| Log-loss | 0.965 | 1.019 |
+| Win prediction accuracy (excl. draws) | 72.3% | 66.6% |
+
+The filter with default parameters underperforms MCMC because the
+MCMC approach jointly estimates system parameters while the filter
+uses fixed defaults. Running `optimize_params()` on the training data
+would close this gap.
+
+### Filter Usage
+
+```python
+from bayesian_elo import prepare_data
+from glickman_filter import SystemParams, run_filter, predict_outcomes, extract_ratings
+
+df = ...  # columns: season, date, home_team, away_team, result
+data = prepare_data(df)
+params = SystemParams()
+
+state = run_filter(data, params)
+ratings = extract_ratings(state, data, period=-1)
+predictions = predict_outcomes(state, data, params)
+```
+
+The `GlickmanPredictor` class provides a stateful wrapper for
+incremental predict-then-update cycles:
+
+```python
+from glickman_filter import GlickmanPredictor
+
+predictor = GlickmanPredictor(historical_df)
+predictor.fit()
+preds = predictor.predict(upcoming_games_df)
+predictor.update(completed_games_df)
+```
 
 ## Usage
 

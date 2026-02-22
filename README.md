@@ -236,6 +236,45 @@ Classical Elo retains the highest decisive-game win accuracy (70.2%),
 likely because its per-match online updates adapt faster within a
 season than the filter's per-season batch updates.
 
+#### Parameter stability across training windows
+
+Optimizing on different subsets of the data reveals which parameters
+are stable properties of the league and which drift over time:
+
+| Window | N | `alpha0` | `alpha1` | `beta0` | `beta1` | `tau` | `sigma_init` |
+|--------|---|----------|----------|---------|---------|-------|--------------|
+| 1993-2002 | 3,964 | 1.23 | -0.018 | -0.16 | ~0 | 0.24 | 0.38 |
+| 1993-2007 | 5,864 | 1.23 | 0.040 | -0.18 | ~0 | 0.36 | 0.38 |
+| 1993-2012 | 7,764 | 1.33 | ~0 | -0.12 | ~0 | 0.35 | 0.43 |
+| 1993-2017 | 9,664 | 1.48 | 0.020 | 0.07 | ~0 | 1.05 | 0.23 |
+| 1993-2022 | 11,113 | 1.14 | 0.008 | -0.20 | ~0 | 0.24 | 0.35 |
+| 2003-2012 | 3,800 | 1.45 | 0.010 | -0.07 | ~0 | 0.52 | 0.89 |
+| 2008-2017 | 3,800 | 1.17 | 0.006 | -0.20 | ~0 | 0.23 | 0.63 |
+| 2013-2022 | 3,349 | 0.80 | 0.009 | -0.35 | ~0 | 0.15 | 0.68 |
+
+**Stable (fix and forget):** `alpha1` and `beta1` consistently
+optimize to near zero. Strength-dependent home advantage and
+strength-dependent draw tendency are not significant in Premier
+League data. These can be hard-coded to 0.
+
+**Slowly drifting:** `alpha0` (home advantage) shows a genuine
+downward trend, from ~1.2-1.5 in earlier decades to **0.80 in
+2013-2022**. This matches the well-documented decline in home
+advantage in football, accelerated by COVID-era empty stadiums.
+`beta0` (draw intercept) drifts modestly alongside it.
+
+**Noisy/interacting:** `tau` and `sigma_init` trade off against each
+other and are sensitive to the optimizer. Their combined effect on
+predictions is more stable than either value alone.
+
+**Recommendation for a weekly prediction system:** Re-optimize
+**once per season** during the off-season, using the most recent
+~10 seasons of data. Parameters are stable enough within a season
+that weekly or monthly re-optimization adds no value, but the drift
+in `alpha0` across years means parameters from 2015 would noticeably
+misfit 2025 data. A trailing window avoids over-weighting the 1990s
+when home advantage dynamics were different.
+
 ### Filter Usage
 
 ```python

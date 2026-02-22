@@ -179,18 +179,62 @@ System parameters (`alpha0`, `alpha1`, `beta0`, `beta1`, `tau`,
 They can be optimized via one-step-ahead predictive log-likelihood
 (Section 5) using `optimize_params()`.
 
-### Results (Default Parameters)
+### Results
 
-| Metric | MCMC | Filter |
-|--------|------|--------|
+#### Default parameters
+
+With hand-picked default parameters, the filter underperforms MCMC on
+all metrics (in-sample over all 11,113 matches):
+
+| Metric | MCMC | Filter (default) |
+|--------|------|------------------|
 | Categorical accuracy (H/D/A) | 53.7% | 49.4% |
 | Log-loss | 0.965 | 1.019 |
 | Win prediction accuracy (excl. draws) | 72.3% | 66.6% |
 
-The filter with default parameters underperforms MCMC because the
-MCMC approach jointly estimates system parameters while the filter
-uses fixed defaults. Running `optimize_params()` on the training data
-would close this gap.
+The gap is primarily because MCMC jointly estimates system parameters
+from the data while the filter uses fixed defaults.
+
+#### Optimized parameters
+
+Running `optimize_params()` on the full dataset maximizes the
+one-step-ahead predictive log-likelihood (Section 5) via Nelder-Mead:
+
+| Parameter | Default | Optimized | Description |
+|-----------|---------|-----------|-------------|
+| `alpha0` | 0.21 | **1.14** | Home advantage intercept |
+| `alpha1` | 0.0 | 0.009 | Strength-dependent home advantage |
+| `beta0` | -0.39 | **-0.20** | Draw intercept |
+| `beta1` | 0.12 | ~0 | Strength-dependent draw tendency |
+| `tau` | 0.15 | **0.24** | Season-to-season volatility |
+| `sigma_init` | 0.50 | **0.35** | Initial rating uncertainty |
+
+The largest shifts are in `alpha0` (home advantage much stronger than
+the default) and `tau` (more season-to-season volatility). The
+strength-dependent draw parameter `beta1` optimized to near zero,
+suggesting this effect is not significant in Premier League data.
+
+#### Expanding-window out-of-sample comparison
+
+To compare fairly across all three approaches, each model predicts
+10,651 matches across seasons 1994-95 through 2021-22 using only
+data from prior seasons (expanding-window evaluation):
+
+| Metric | Elo | MCMC | Filter (default) | Filter (optimized) |
+|--------|-----|------|-------------------|--------------------|
+| Categorical accuracy (H/D/A) | -- | 51.6% | 49.8% | **51.5%** |
+| Win accuracy (excl. draws) | **70.2%** | 69.3% | 66.8% | 69.1% |
+| Log-loss | 1.047 | 0.999 | 1.015 | **0.997** |
+
+With optimized parameters, the filter matches MCMC across all
+metrics. On log-loss it edges out MCMC (0.997 vs 0.999), achieving
+the lowest log-loss in 20 of 28 individual seasons. Both Bayesian
+approaches substantially outperform classical Elo on log-loss, which
+measures the full three-way probability calibration.
+
+Classical Elo retains the highest decisive-game win accuracy (70.2%),
+likely because its per-match online updates adapt faster within a
+season than the filter's per-season batch updates.
 
 ### Filter Usage
 
